@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 发布时由可信发布流水线填入，空值使在线安装明确停止；绝不跳过 SHA256。
-RELEASE_REPOSITORY=""
-RELEASE_TAG=""
-BUNDLE_SHA256=""
+RELEASE_REPOSITORY="decimalcalcu/XDrepo-w748mmbkMC"
+RELEASE_TAG="bootstrap-v0.1.0"
+BUNDLE_SHA256="28745472bb2fe3b57bb293902994d13f6a79d7be5d01e68c79ed240a71f3138c"
 
 set -Eeuo pipefail
 umask 077
