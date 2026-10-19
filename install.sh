@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 RELEASE_REPOSITORY="decimalcalcu/XDrepo-w748mmbkMC"
-RELEASE_TAG="bootstrap-v0.1.2"
-BUNDLE_SHA256="5180060c622f3428239b3854e7433176d026431aaca1851c6d59d7118d377fe4"
+RELEASE_TAG="bootstrap-v0.1.3"
+BUNDLE_SHA256="66eddf558a1fc6da7e532d4c8d57aebf45f1403257ced59be6b3b0c019b10505"
 
 set -Eeuo pipefail
 umask 077
@@ -13,7 +13,7 @@ UNIT=twcn-pve-bootstrap.service
 UNIT_PATH=/etc/systemd/system/$UNIT
 LOCK_FILE=/run/lock/twcn-pve-bootstrap.lock
 PORT=8088
-EXPECTED_BOOTSTRAP_VERSION="0.1.2"
+EXPECTED_BOOTSTRAP_VERSION="0.1.3"
 BACKUP_ROOT=/var/backups/twcn-pve-bootstrap
 
 die() { printf '%s\n' "安装停止：$*" >&2; exit 1; }
@@ -26,9 +26,6 @@ validate_install_root() {
 
 show_management_address() {
     printf '管理地址：https://%s:%s\n' "$1" "$PORT"
-    runuser -u twcn-pve -- env "TWCN_BOOTSTRAP_DATA_DIR=$STATE_DIR" \
-        "TWCN_BOOTSTRAP_ORIGIN=https://$1:$PORT" \
-        "$INSTALL_ROOT/current/.venv/bin/python" "$INSTALL_ROOT/current/显示初始化链接.py"
     printf '首次访问请确认 HTTPS 证书。\n'
 }
 
@@ -246,7 +243,7 @@ try:
                 raise ValueError("解包总大小超限")
             members.append(item)
             names.add(normalized)
-        required = {"启动维护页.py", "显示初始化链接.py", "pve_bootstrap/initialization.py", "pve_bootstrap/app.py", "pve_bootstrap/settings.py", "requirements-linux.lock", "deploy/twcn-pve-bootstrap.service"}
+        required = {"启动维护页.py", "pve_bootstrap/app.py", "pve_bootstrap/settings.py", "requirements-linux.lock", "deploy/twcn-pve-bootstrap.service"}
         files = {pathlib.PurePosixPath(item.name).as_posix() for item in members if item.isfile()}
         if not required <= files or not any(name.startswith("wheelhouse/") and name.endswith(".whl") for name in files):
             raise ValueError("缺少固定结构或离线 wheelhouse")
@@ -272,7 +269,7 @@ preflight() {
     [[ -r /etc/os-release && -d /run/systemd/system ]] || die "需要真实 Debian/PVE systemd 宿主"
     grep -Eq '^ID=(debian|"debian")$' /etc/os-release || die "需要 Debian/PVE 宿主"
     local command
-    for command in pveversion systemctl apt-get ip ss flock useradd groupadd getent install readlink runuser cmp; do
+    for command in pveversion systemctl apt-get ip ss flock useradd groupadd getent install readlink cmp; do
         command -v "$command" >/dev/null || die "缺少 PVE 系统基础命令：$command"
     done
     pveversion | grep -q '^pve-manager/' || die "pveversion 未确认 PVE 宿主"
@@ -743,7 +740,7 @@ uninstall_bootstrap() {
     verify_uninstalled || die "卸载状态核验失败"
     completed=1
     trap - EXIT
-    printf '已卸载；管理员、配置、证书和上传数据保留。\n备份：%s\n' "$backup"
+    printf '已卸载；配置、证书和上传数据保留。\n备份：%s\n' "$backup"
 }
 
 select_action() {
