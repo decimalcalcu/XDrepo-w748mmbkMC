@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# 发布时由可信发布流水线填入，空值使在线安装明确停止；绝不跳过 SHA256。
 RELEASE_REPOSITORY="decimalcalcu/XDrepo-w748mmbkMC"
 RELEASE_TAG="bootstrap-v0.1.0"
 BUNDLE_SHA256="28745472bb2fe3b57bb293902994d13f6a79d7be5d01e68c79ed240a71f3138c"
@@ -23,11 +22,11 @@ validate_install_root() {
 }
 
 show_management_address() {
-    printf '\n管理地址：https://%s:%s\n' "$1" "$PORT"
+    printf '管理地址：https://%s:%s\n' "$1" "$PORT"
     if [[ -f "$STATE_DIR/bootstrap-token.txt" ]]; then
         printf '首次令牌文件：%s/bootstrap-token.txt\n' "$STATE_DIR"
     fi
-    printf '证书需在浏览器建立信任；运行端和 TUF 安装升级尚未接入。\n'
+    printf '首次访问请确认 HTTPS 证书。\n'
 }
 
 reject_path_links() {
@@ -66,7 +65,6 @@ validate_preserved_paths() {
         "$CONFIG_DIR/tls/private-key.pem" "$STATE_DIR/tls" "$STATE_DIR/tls/certificate.pem" "$STATE_DIR/tls/private-key.pem"; do
         reject_path_links "$path"
     done
-    # 仅状态目录本身允许服务账号写；所有 root 写入的父路径都必须由 root 控制。
     for path in "$INSTALL_ROOT" "$INSTALL_ROOT/releases" "$(dirname -- "$STATE_DIR")" "$CONFIG_DIR" \
         "$CONFIG_DIR/bootstrap.env" "$CONFIG_DIR/tls" "$CONFIG_DIR/tls/certificate.pem" "$CONFIG_DIR/tls/private-key.pem"; do
         require_root_controlled "$path"
@@ -101,7 +99,6 @@ PY
 }
 
 prepare_tls() {
-    # 同时检查旧地址和新地址，dangling symlink 也必须拒绝，而非视作缺文件。
     local path
     for path in "$STATE_DIR/tls" "$STATE_DIR/tls/certificate.pem" "$STATE_DIR/tls/private-key.pem" \
         "$CONFIG_DIR" "$CONFIG_DIR/tls" "$CONFIG_DIR/tls/certificate.pem" "$CONFIG_DIR/tls/private-key.pem"; do
@@ -122,7 +119,6 @@ prepare_tls() {
     fi
     install -d -m 0750 -o root -g twcn-pve "$CONFIG_DIR/tls"
     require_root_controlled "$CONFIG_DIR/tls"
-    # OpenSSL 只写本轮 root 0700 暂存目录；永不以 root 写服务账号可控目录。
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256 -days 365 -nodes \
         -keyout "$temp/tls-key.pem" -out "$temp/tls-cert.pem" -subj '/CN=TWCN PVE bootstrap' \
         -addext "subjectAltName=IP:$lan_ip,DNS:$hostname_fqdn,DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
@@ -130,7 +126,6 @@ prepare_tls() {
 import grp, os, pathlib, sys
 gid = grp.getgrnam("twcn-pve").gr_gid
 for source, target in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
-    # root 独占写目录 + O_EXCL/O_NOFOLLOW；不覆盖普通文件或 dangling 链接。
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
     with os.fdopen(fd, "wb") as stream:
         stream.write(pathlib.Path(source).read_bytes())
@@ -216,7 +211,6 @@ try:
         files = {pathlib.PurePosixPath(item.name).as_posix() for item in members if item.isfile()}
         if not required <= files or not any(name.startswith("wheelhouse/") and name.endswith(".whl") for name in files):
             raise ValueError("缺少固定结构或离线 wheelhouse")
-        # 全量检查完成才写出；目标只能为空或不存在的暂存目录。
         if destination.exists() and any(destination.iterdir()):
             raise ValueError("暂存目录非空")
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -251,9 +245,8 @@ preflight() {
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || need_packages=1
     python3 -c 'import venv,ensurepip' >/dev/null 2>&1 || need_packages=1
     if [[ "$need_packages" -eq 1 ]]; then
-        # 仅正常系统源补基础依赖；不改源、不移除任何 PVE/VM 组件。
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv curl ca-certificates openssl
+        apt-get -qq update
+        DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends python3 python3-venv curl ca-certificates openssl
     fi
     python3 -c 'import sys,venv,ensurepip; assert sys.version_info >= (3, 11)' || die "需要 Python 3.11+ 和系统 venv/ensurepip"
 }
@@ -277,11 +270,9 @@ install_bootstrap() {
     validate_saved_tls_config
     exec 9>/run/lock/twcn-pve-bootstrap.lock
     flock -n 9 || die "已有首次安装操作进行中"
-    # EXIT trap 在函数返回后仍访问这些本轮状态，因此有意使用全局变量。
     temp=""; stage=""; old_target=""; activated=0; service_was_active=0; unit_created=0
     local lan_ip hostname_fqdn bundle digest release cert key allow_hosts health_host
     temp=$(mktemp -d /tmp/twcn-pve-bootstrap.XXXXXXXX)
-    # 失败只恢复本轮 bootstrap 指向；不触及 runtime、QEMU、PVE 8006 或 VM。
     cleanup() {
         local result=$?
         trap - EXIT
@@ -341,11 +332,9 @@ install_bootstrap() {
         [[ "$health_host" =~ ^[A-Za-z0-9.-]+$ && -f "$cert" ]] || die "既有配置需人工检查"
         curl --fail --silent --show-error --noproxy '*' --connect-timeout 2 --max-time 5 --cacert "$cert" "https://$health_host:$PORT/healthz" > "$temp/health.json"
         verify_health "$temp/health.json"
-        printf '既有基础维护页健康检查通过。\n'
         show_management_address "$health_host"
         return
     fi
-    # 非幂等已运行状态下拒绝占用端口；不杀进程、不停止其他服务。
     [[ -z "$(ss -H -ltn "sport = :$PORT")" ]] || die "8088 端口已占用，保留现有进程；更换版本请走经过审核的独立维护流程"
     systemctl is-active --quiet "$UNIT" && service_was_active=1
     getent group twcn-pve >/dev/null || groupadd --system twcn-pve
@@ -377,9 +366,8 @@ EOF
         stage=$(mktemp -d "$INSTALL_ROOT/releases/.stage.XXXXXXXX")
         extract_bundle "$bundle" "$stage"
         python3 -m venv "$stage/.venv"
-        "$stage/.venv/bin/python" -m pip install --no-index --no-cache-dir --require-hashes \
+        "$stage/.venv/bin/python" -m pip install --quiet --no-index --no-cache-dir --require-hashes \
             --find-links "$stage/wheelhouse" -r "$stage/requirements-linux.lock"
-        # venv 内脚本嵌入临时目录；服务固定调用 python，不使用 pip/uvicorn 启动器。
         chmod -R a+rX "$stage"
         mv -T "$stage" "$release"
         stage=""
@@ -394,7 +382,7 @@ EOF
     mv -Tf "$INSTALL_ROOT/.current.$$" "$INSTALL_ROOT/current"
     activated=1
     systemctl daemon-reload
-    systemctl enable "$UNIT"
+    systemctl --quiet enable "$UNIT"
     systemctl start "$UNIT"
     local healthy=0
     for attempt in {1..20}; do
@@ -406,7 +394,6 @@ EOF
     done
     [[ "$healthy" -eq 1 ]] || die "HTTPS 基础维护页健康检查失败"
     activated=0
-    printf '基础维护页安装完成，HTTPS健康检查通过。\n'
     show_management_address "$health_host"
 }
 
