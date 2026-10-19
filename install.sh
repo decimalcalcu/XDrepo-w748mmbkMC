@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 RELEASE_REPOSITORY="decimalcalcu/XDrepo-w748mmbkMC"
-RELEASE_TAG="bootstrap-v0.1.0"
-BUNDLE_SHA256="28745472bb2fe3b57bb293902994d13f6a79d7be5d01e68c79ed240a71f3138c"
+RELEASE_TAG="bootstrap-v0.1.1"
+BUNDLE_SHA256="00cd46358fe512b79f2c560e5faf72bd20596b0c33eaa73a28526ac19e1e9360"
 
 set -Eeuo pipefail
 umask 077
@@ -10,8 +10,10 @@ INSTALL_ROOT=/opt/twcn-pve/bootstrap
 STATE_DIR=/var/lib/twcn-pve/bootstrap
 CONFIG_DIR=/etc/twcn-pve
 UNIT=twcn-pve-bootstrap.service
+UNIT_PATH=/etc/systemd/system/$UNIT
+LOCK_FILE=/run/lock/twcn-pve-bootstrap.lock
 PORT=8088
-EXPECTED_BOOTSTRAP_VERSION="0.1.0"
+EXPECTED_BOOTSTRAP_VERSION="0.1.1"
 
 die() { printf '%s\n' "安装停止：$*" >&2; exit 1; }
 
@@ -23,10 +25,46 @@ validate_install_root() {
 
 show_management_address() {
     printf '管理地址：https://%s:%s\n' "$1" "$PORT"
-    if [[ -f "$STATE_DIR/bootstrap-token.txt" ]]; then
-        printf '首次令牌文件：%s/bootstrap-token.txt\n' "$STATE_DIR"
-    fi
+    runuser -u twcn-pve -- env "TWCN_BOOTSTRAP_DATA_DIR=$STATE_DIR" \
+        "TWCN_BOOTSTRAP_ORIGIN=https://$1:$PORT" \
+        "$INSTALL_ROOT/current/.venv/bin/python" "$INSTALL_ROOT/current/显示初始化链接.py"
     printf '首次访问请确认 HTTPS 证书。\n'
+}
+
+validate_managed_unit() {
+    local load_state fragment dropins reload
+    [[ -n "$old_target" && -f "$old_target/deploy/$UNIT" && -f "$UNIT_PATH" && ! -L "$UNIT_PATH" ]] \
+        || die "服务不是受管版本，保留现状请人工审查"
+    require_root_controlled "$old_target/deploy/$UNIT"
+    require_root_controlled "$UNIT_PATH"
+    cmp -s "$old_target/deploy/$UNIT" "$UNIT_PATH" || die "既有 unit 发生漂移，保留现状请人工审查"
+    load_state=$(systemctl show --property=LoadState --value "$UNIT") || die "unit 查询失败，保留现状"
+    fragment=$(systemctl show --property=FragmentPath --value "$UNIT") || die "unit 查询失败，保留现状"
+    dropins=$(systemctl show --property=DropInPaths --value "$UNIT") || die "unit 查询失败，保留现状"
+    reload=$(systemctl show --property=NeedDaemonReload --value "$UNIT") || die "unit 查询失败，保留现状"
+    [[ "$load_state" == loaded && "$fragment" == "$UNIT_PATH" && -z "$dropins" && "$reload" == no ]] \
+        || die "既有 unit 加载状态发生漂移，保留现状请人工审查"
+}
+
+validate_service_listener() {
+    local listeners main_pid line remaining found
+    listeners=$(ss -H -ltnp "sport = :$PORT") || die "端口归属查询失败，保留现状"
+    if [[ "$service_was_active" -eq 1 ]]; then
+        validate_managed_unit
+    fi
+    [[ -n "$listeners" ]] || return 0
+    [[ "$service_was_active" -eq 1 ]] || die "8088 端口属于其他进程，保留现状"
+    main_pid=$(systemctl show --property=MainPID --value "$UNIT") || die "主进程查询失败，保留现状"
+    [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || die "服务主进程不明，保留现状"
+    while IFS= read -r line; do
+        remaining="$line"; found=0
+        while [[ "$remaining" =~ pid=([0-9]+) ]]; do
+            [[ "${BASH_REMATCH[1]}" == "$main_pid" ]] || die "8088 端口含外来进程，保留现状"
+            remaining=${remaining#*"${BASH_REMATCH[0]}"}
+            found=1
+        done
+        [[ "$found" -eq 1 ]] || die "8088 端口所有者不明，保留现状"
+    done <<< "$listeners"
 }
 
 reject_path_links() {
@@ -207,7 +245,7 @@ try:
                 raise ValueError("解包总大小超限")
             members.append(item)
             names.add(normalized)
-        required = {"启动维护页.py", "pve_bootstrap/app.py", "pve_bootstrap/settings.py", "requirements-linux.lock", "deploy/twcn-pve-bootstrap.service"}
+        required = {"启动维护页.py", "显示初始化链接.py", "pve_bootstrap/initialization.py", "pve_bootstrap/app.py", "pve_bootstrap/settings.py", "requirements-linux.lock", "deploy/twcn-pve-bootstrap.service"}
         files = {pathlib.PurePosixPath(item.name).as_posix() for item in members if item.isfile()}
         if not required <= files or not any(name.startswith("wheelhouse/") and name.endswith(".whl") for name in files):
             raise ValueError("缺少固定结构或离线 wheelhouse")
@@ -233,7 +271,7 @@ preflight() {
     [[ -r /etc/os-release && -d /run/systemd/system ]] || die "需要真实 Debian/PVE systemd 宿主"
     grep -Eq '^ID=(debian|"debian")$' /etc/os-release || die "需要 Debian/PVE 宿主"
     local command
-    for command in pveversion systemctl apt-get ip ss flock useradd groupadd getent install readlink; do
+    for command in pveversion systemctl apt-get ip ss flock useradd groupadd getent install readlink runuser cmp; do
         command -v "$command" >/dev/null || die "缺少 PVE 系统基础命令：$command"
     done
     pveversion | grep -q '^pve-manager/' || die "pveversion 未确认 PVE 宿主"
@@ -268,7 +306,7 @@ install_bootstrap() {
     preflight
     validate_preserved_paths
     validate_saved_tls_config
-    exec 9>/run/lock/twcn-pve-bootstrap.lock
+    exec 9>"$LOCK_FILE"
     flock -n 9 || die "已有首次安装操作进行中"
     temp=""; stage=""; old_target=""; activated=0; service_was_active=0; unit_created=0
     local lan_ip hostname_fqdn bundle digest release cert key allow_hosts health_host
@@ -286,11 +324,11 @@ install_bootstrap() {
                 rm -f -- "$INSTALL_ROOT/current"
                 systemctl disable "$UNIT" >/dev/null 2>&1 || true
                 if [[ "$unit_created" -eq 1 ]]; then
-                    rm -f -- "/etc/systemd/system/$UNIT"
+                    rm -f -- "$UNIT_PATH"
                     systemctl daemon-reload || true
                 fi
             fi
-            printf '%s\n' "首次启动失败，已撤销本轮 bootstrap 激活；私有数据与证书保留。" >&2
+            printf '%s\n' "激活失败，已尝试恢复原版；请核对服务状态。" >&2
         fi
         if [[ -n "$stage" ]]; then
             validate_cleanup_path "$stage" stage
@@ -325,6 +363,8 @@ install_bootstrap() {
     elif [[ -e "$INSTALL_ROOT/current" ]]; then
         die "current 已存在但不是受管版本链接"
     fi
+    if systemctl is-active --quiet "$UNIT"; then service_was_active=1; fi
+    validate_service_listener
     if [[ "$old_target" == "$release" ]] && systemctl is-active --quiet "$UNIT"; then
         health_host=$(config_value TWCN_BOOTSTRAP_ALLOWED_HOSTS)
         health_host=${health_host%%,*}
@@ -335,8 +375,6 @@ install_bootstrap() {
         show_management_address "$health_host"
         return
     fi
-    [[ -z "$(ss -H -ltn "sport = :$PORT")" ]] || die "8088 端口已占用，保留现有进程；更换版本请走经过审核的独立维护流程"
-    systemctl is-active --quiet "$UNIT" && service_was_active=1
     getent group twcn-pve >/dev/null || groupadd --system twcn-pve
     id -u twcn-pve >/dev/null 2>&1 || useradd --system --gid twcn-pve --home-dir "$STATE_DIR" --no-create-home --shell /usr/sbin/nologin twcn-pve
     [[ "$(id -u twcn-pve)" -ne 0 ]] || die "twcn-pve 必须为非 root 账号"
@@ -372,15 +410,24 @@ EOF
         mv -T "$stage" "$release"
         stage=""
     fi
-    if [[ ! -e "/etc/systemd/system/$UNIT" ]]; then
-        install -m 0644 "$release/deploy/$UNIT" "/etc/systemd/system/$UNIT"
+    if [[ ! -e "$UNIT_PATH" ]]; then
+        install -m 0644 "$release/deploy/$UNIT" "$UNIT_PATH"
         unit_created=1
     else
-        cmp -s "$release/deploy/$UNIT" "/etc/systemd/system/$UNIT" || die "既有 unit 与模板不同，保留人工配置，请先审核"
+        cmp -s "$release/deploy/$UNIT" "$UNIT_PATH" || die "既有 unit 与模板不同，保留人工配置，请先审核"
+        validate_managed_unit
     fi
+    local still_active=0
+    if systemctl is-active --quiet "$UNIT"; then still_active=1; fi
+    [[ "$still_active" -eq "$service_was_active" ]] || die "服务状态已变化，保留现状请重试"
+    validate_service_listener
+    activated=1
+    if [[ "$service_was_active" -eq 1 ]]; then systemctl stop "$UNIT"; fi
+    local remaining_listeners
+    remaining_listeners=$(ss -H -ltnp "sport = :$PORT") || die "端口归属查询失败，恢复旧版"
+    [[ -z "$remaining_listeners" ]] || die "8088 端口仍被占用，保留进程并恢复旧版"
     ln -s "$release" "$INSTALL_ROOT/.current.$$"
     mv -Tf "$INSTALL_ROOT/.current.$$" "$INSTALL_ROOT/current"
-    activated=1
     systemctl daemon-reload
     systemctl --quiet enable "$UNIT"
     systemctl start "$UNIT"
