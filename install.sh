@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 RELEASE_REPOSITORY="decimalcalcu/XDrepo-w748mmbkMC"
-RELEASE_TAG="bootstrap-v0.1.1"
-BUNDLE_SHA256="00cd46358fe512b79f2c560e5faf72bd20596b0c33eaa73a28526ac19e1e9360"
+RELEASE_TAG="bootstrap-v0.1.2"
+BUNDLE_SHA256="5180060c622f3428239b3854e7433176d026431aaca1851c6d59d7118d377fe4"
 
 set -Eeuo pipefail
 umask 077
@@ -13,7 +13,8 @@ UNIT=twcn-pve-bootstrap.service
 UNIT_PATH=/etc/systemd/system/$UNIT
 LOCK_FILE=/run/lock/twcn-pve-bootstrap.lock
 PORT=8088
-EXPECTED_BOOTSTRAP_VERSION="0.1.1"
+EXPECTED_BOOTSTRAP_VERSION="0.1.2"
+BACKUP_ROOT=/var/backups/twcn-pve-bootstrap
 
 die() { printf '%s\n' "安装停止：$*" >&2; exit 1; }
 
@@ -444,8 +445,327 @@ EOF
     show_management_address "$health_host"
 }
 
+uninstall_preflight() {
+    [[ "$EUID" -eq 0 ]] || die "请以 root 运行"
+    local command
+    for command in systemctl ss flock readlink cmp mv cp rm mkdir chmod mktemp stat "$PYTHON_BIN"; do
+        command -v "$command" >/dev/null || die "缺少系统命令：$command"
+    done
+    validate_install_root "$INSTALL_ROOT"
+    [[ "$UNIT" == twcn-pve-bootstrap.service && "$UNIT_PATH" == /etc/systemd/system/twcn-pve-bootstrap.service \
+        && "$BACKUP_ROOT" == /var/backups/twcn-pve-bootstrap ]] || die "卸载固定路径发生漂移"
+}
+
+validate_program_tree() {
+    "$PYTHON_BIN" - "${1:-$INSTALL_ROOT}" "$BACKUP_ROOT" <<'PY'
+import os, pathlib, re, stat, sys
+root, backup = map(pathlib.Path, sys.argv[1:])
+device = root.lstat().st_dev
+if device != backup.stat().st_dev or os.path.ismount(root):
+    raise SystemExit("程序目录跨文件系统或挂载点，保留现状")
+for line in pathlib.Path("/proc/self/mountinfo").read_text().splitlines():
+    mount = pathlib.Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4]))
+    if mount == root or root in mount.parents or mount == backup or backup in mount.parents:
+        raise SystemExit("程序或备份目录含挂载点，保留现状")
+for directory, dirs, files in os.walk(root, followlinks=False):
+    for path in [pathlib.Path(directory), *(pathlib.Path(directory) / name for name in dirs + files)]:
+        info = path.lstat()
+        if info.st_dev != device or os.path.ismount(path):
+            raise SystemExit("程序目录含挂载点，保留现状")
+        if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
+            raise SystemExit("程序目录非 root 独占写入，保留现状")
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            raise SystemExit("程序目录含特殊文件，保留现状")
+PY
+}
+
+acquire_maintenance_lock() {
+    if [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]; then
+        (set -o noclobber; : > "$LOCK_FILE") || die "锁文件创建失败"
+    fi
+    "$PYTHON_BIN" - "$LOCK_FILE" <<'PY'
+import pathlib, stat, sys
+path = pathlib.Path(sys.argv[1])
+for parent in path.parents:
+    info = parent.lstat()
+    sticky_lock_directory = parent == path.parent and bool(info.st_mode & stat.S_ISVTX)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or (info.st_mode & 0o022 and not sticky_lock_directory):
+        raise SystemExit("锁文件父目录不受 root 控制，保留现状")
+info = path.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_nlink != 1:
+    raise SystemExit("锁文件不受 root 独占控制，保留现状")
+PY
+    exec 9<>"$LOCK_FILE"
+    [[ /proc/$$/fd/9 -ef "$LOCK_FILE" ]] || die "锁文件身份发生漂移"
+    flock -n 9 || die "已有维护操作进行中"
+}
+
+move_program() {
+    "$PYTHON_BIN" - "$1" "$2" <<'PY'
+import os, sys
+if os.path.lexists(sys.argv[2]):
+    raise SystemExit("目标目录已经存在，保留现状")
+os.rename(sys.argv[1], sys.argv[2])
+PY
+}
+
+validate_uninstall_unit_content() {
+    "$PYTHON_BIN" - "$1" <<'PY'
+import hashlib, pathlib, sys
+expected = "74b032242bd1751e488109a1ec07961c90600199e6c7dc3cb3aabb6f82acaac9"
+if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() != expected:
+    raise SystemExit("unit 不符合固定受管模板，保留现状")
+PY
+}
+
+read_uninstall_state() {
+    uninstall_active=$(systemctl show --property=ActiveState --value "$UNIT") || die "服务状态查询失败，保留现状"
+    uninstall_enabled=$(systemctl show --property=UnitFileState --value "$UNIT") || die "启用状态查询失败，保留现状"
+    [[ "$uninstall_active" == active || "$uninstall_active" == inactive ]] || die "服务状态发生漂移，保留现状"
+    [[ "$uninstall_enabled" == enabled || "$uninstall_enabled" == disabled ]] || die "启用状态发生漂移，保留现状"
+    service_was_active=0
+    [[ "$uninstall_active" != active ]] || service_was_active=1
+}
+
+verify_uninstalled() {
+    local load active enabled fragment dropins reload
+    load=$(systemctl show --property=LoadState --value "$UNIT") || return 1
+    active=$(systemctl show --property=ActiveState --value "$UNIT") || return 1
+    enabled=$(systemctl show --property=UnitFileState --value "$UNIT") || return 1
+    fragment=$(systemctl show --property=FragmentPath --value "$UNIT") || return 1
+    dropins=$(systemctl show --property=DropInPaths --value "$UNIT") || return 1
+    reload=$(systemctl show --property=NeedDaemonReload --value "$UNIT") || return 1
+    [[ "$load" == not-found && "$active" == inactive && ( -z "$enabled" || "$enabled" == disabled ) \
+        && -z "$fragment" && -z "$dropins" && "$reload" == no \
+        && ! -e "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" && ! -e "$UNIT_PATH" && ! -L "$UNIT_PATH" ]]
+}
+
+backup_manifest() {
+    "$PYTHON_BIN" - "$backup" "$1" <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+base, action = pathlib.Path(sys.argv[1]), sys.argv[2]
+records = {}
+for root in (base / "program", base / "unit"):
+    if not root.exists() or root.is_symlink():
+        raise SystemExit("备份结构缺失")
+    paths = [root]
+    if root.is_dir():
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            paths.extend(pathlib.Path(directory) / name for name in dirs + files)
+    for path in paths:
+        info = path.lstat()
+        name = path.relative_to(base).as_posix()
+        if stat.S_ISLNK(info.st_mode):
+            records[name] = {"link": os.readlink(path)}
+        elif stat.S_ISDIR(info.st_mode):
+            records[name] = {"directory": True}
+        elif stat.S_ISREG(info.st_mode):
+            with path.open("rb") as stream:
+                records[name] = {"sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
+        else:
+            raise SystemExit("备份包含特殊文件")
+        records[name].update(mode=stat.S_IMODE(info.st_mode), uid=info.st_uid, gid=info.st_gid)
+manifest = base / "SHA256SUMS.json"
+if action == "create":
+    with manifest.open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(records, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+elif action != "check" or records != json.loads(manifest.read_text(encoding="utf-8")):
+    raise SystemExit("备份 SHA256/结构校验失败")
+PY
+}
+
+check_uninstall_backup() {
+    local path
+    [[ "$backup" == "$BACKUP_ROOT/"* && "$backup" != "$BACKUP_ROOT/" ]] || die "备份路径漂移"
+    for path in "$BACKUP_ROOT" "$backup" "$backup/unit" "$backup/SHA256SUMS.json" "$backup/rollback.sh"; do
+        reject_path_links "$path" || return 1
+        require_root_controlled "$path" || return 1
+    done
+    [[ "$(stat -c %a "$backup")" == 700 ]] || die "备份目录权限漂移"
+    validate_program_tree "$backup/program" || return 1
+    backup_manifest check || return 1
+    validate_uninstall_unit_content "$backup/unit" || return 1
+    [[ -L "$backup/program/current" ]] || die "备份 current 不是受管链接"
+    local target
+    target=$(readlink -- "$backup/program/current") || die "备份链接查询失败"
+    [[ "$target" == "$old_target" ]] || die "备份 current 发生漂移"
+    cmp -s "$backup/unit" "$backup/program/releases/${old_target#"$INSTALL_ROOT/releases/"}/deploy/$UNIT" || die "备份 unit 不一致"
+}
+
+write_uninstall_rollback() {
+    {
+        printf '#!/usr/bin/env bash\nset -Eeuo pipefail\numask 077\n'
+        local name
+        for name in INSTALL_ROOT UNIT UNIT_PATH BACKUP_ROOT LOCK_FILE PYTHON_BIN old_target backup uninstall_active uninstall_enabled; do
+            printf '%s=%q\n' "$name" "${!name}"
+        done
+        declare -f die validate_install_root reject_path_links require_root_controlled uninstall_preflight acquire_maintenance_lock move_program validate_program_tree validate_uninstall_unit_content backup_manifest check_uninstall_backup verify_uninstalled
+        cat <<'ROLLBACK'
+uninstall_preflight
+acquire_maintenance_lock
+check_uninstall_backup
+case "${1:-check}" in
+    check) printf '备份校验通过。\n' ;;
+    restore)
+        reject_path_links "$INSTALL_ROOT"
+        reject_path_links "$UNIT_PATH"
+        require_root_controlled "$(dirname -- "$INSTALL_ROOT")"
+        require_root_controlled "$(dirname -- "$UNIT_PATH")"
+        verify_uninstalled || die "已有安装或服务状态发生变化，保留现状"
+        listeners=$(ss -H -ltnp 'sport = :8088') || die "端口查询失败，保留现状"
+        [[ -z "$listeners" ]] || die "8088 端口存在其他进程，保留现状"
+        "$PYTHON_BIN" - "$backup/program" "$INSTALL_ROOT" <<'PY'
+import os, pathlib, sys
+source, target = map(pathlib.Path, sys.argv[1:])
+if source.stat().st_dev != target.parent.stat().st_dev:
+    raise SystemExit("恢复路径跨文件系统，保留现状")
+PY
+        restore_program_moved=0; restore_unit_written=0
+        restore_cleanup() {
+            result=$?
+            trap - EXIT
+            if [[ "$result" -ne 0 ]]; then
+                if [[ "$restore_unit_written" -eq 1 ]]; then
+                    systemctl stop "$UNIT" || true
+                    systemctl --quiet disable "$UNIT" || true
+                    rm -- "$UNIT_PATH" || true
+                fi
+                if [[ "$restore_program_moved" -eq 1 && ! -e "$backup/program" ]]; then
+                    move_program "$INSTALL_ROOT" "$backup/program" || true
+                fi
+                systemctl daemon-reload || true
+                if verify_uninstalled && check_uninstall_backup; then
+                    printf '恢复失败，备份已保留；可核验后重试。\n' >&2
+                else printf '恢复失败，程序与服务状态需人工核对。\n' >&2; fi
+            fi
+            exit "$result"
+        }
+        trap restore_cleanup EXIT
+        move_program "$backup/program" "$INSTALL_ROOT"
+        restore_program_moved=1
+        restore_unit_written=1
+        cp -p -- "$backup/unit" "$UNIT_PATH"
+        systemctl daemon-reload
+        if [[ "$uninstall_enabled" == enabled ]]; then systemctl --quiet enable "$UNIT"; else systemctl --quiet disable "$UNIT"; fi
+        if [[ "$uninstall_active" == active ]]; then systemctl start "$UNIT"; fi
+        active=$(systemctl show --property=ActiveState --value "$UNIT")
+        enabled=$(systemctl show --property=UnitFileState --value "$UNIT")
+        [[ "$active" == "$uninstall_active" && "$enabled" == "$uninstall_enabled" ]] || die "恢复状态需人工核对"
+        trap - EXIT
+        printf '程序与服务状态已恢复，数据保持原位。\n'
+        ;;
+    *) die "用法：rollback.sh [check|restore]" ;;
+esac
+ROLLBACK
+    } > "$backup/rollback.sh"
+    chmod 0700 "$backup/rollback.sh"
+}
+
+uninstall_bootstrap() {
+    uninstall_preflight
+    local path
+    for path in "$INSTALL_ROOT" "$INSTALL_ROOT/releases" "$UNIT_PATH" "$BACKUP_ROOT"; do
+        reject_path_links "$path"
+        require_root_controlled "$path"
+    done
+    acquire_maintenance_lock
+    if [[ ! -e "$INSTALL_ROOT" && ! -e "$UNIT_PATH" ]]; then
+        verify_uninstalled || die "服务状态发生漂移，保留现状"
+        printf '已卸载。\n'
+        return
+    fi
+    [[ -d "$INSTALL_ROOT" && -f "$UNIT_PATH" && -L "$INSTALL_ROOT/current" ]] || die "安装结构发生漂移，保留现状"
+    old_target=$(readlink -f -- "$INSTALL_ROOT/current") || die "current 查询失败"
+    [[ "$old_target" == "$INSTALL_ROOT/releases/"* && -d "$old_target" ]] || die "current 不在本模块 releases，保留现状"
+    reject_path_links "$old_target"
+    require_root_controlled "$old_target"
+    read_uninstall_state
+    validate_managed_unit
+    validate_uninstall_unit_content "$UNIT_PATH"
+    validate_service_listener
+    mkdir -p -m 0700 -- "$BACKUP_ROOT"
+    require_root_controlled "$BACKUP_ROOT"
+    validate_program_tree
+    backup=$(mktemp -d "$BACKUP_ROOT/uninstall.XXXXXXXX")
+    chmod 0700 "$backup"
+    cp -p -- "$UNIT_PATH" "$backup/unit"
+    changed=0; program_moved=0; unit_removed=0; completed=0
+    uninstall_cleanup() {
+        local result=$? restored=1 active enabled
+        trap - EXIT
+        if [[ "$result" -ne 0 && "$changed" -eq 1 && "$completed" -eq 0 ]]; then
+            if [[ "$program_moved" -eq 1 ]]; then
+                if [[ ! -e "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]]; then
+                    move_program "$backup/program" "$INSTALL_ROOT" || restored=0
+                else restored=0; fi
+            fi
+            if [[ "$unit_removed" -eq 1 ]]; then
+                if [[ ! -e "$UNIT_PATH" && ! -L "$UNIT_PATH" ]]; then cp -p -- "$backup/unit" "$UNIT_PATH" || restored=0; else restored=0; fi
+            fi
+            systemctl daemon-reload || restored=0
+            if [[ "$uninstall_enabled" == enabled ]]; then systemctl --quiet enable "$UNIT" || restored=0; else systemctl --quiet disable "$UNIT" || restored=0; fi
+            if [[ "$uninstall_active" == active ]]; then systemctl start "$UNIT" || restored=0; else systemctl stop "$UNIT" || restored=0; fi
+            active=$(systemctl show --property=ActiveState --value "$UNIT") || restored=0
+            enabled=$(systemctl show --property=UnitFileState --value "$UNIT") || restored=0
+            [[ "$active" == "$uninstall_active" && "$enabled" == "$uninstall_enabled" && -d "$INSTALL_ROOT" ]] || restored=0
+            cmp -s "$UNIT_PATH" "$backup/unit" || restored=0
+            if [[ "$restored" -eq 1 ]]; then printf '卸载失败，原程序与服务状态已恢复。\n' >&2
+            else printf '卸载失败，恢复未完整确认；请核对备份：%s\n' "$backup" >&2; fi
+        fi
+        exit "$result"
+    }
+    trap uninstall_cleanup EXIT
+    local active enabled
+    active=$(systemctl show --property=ActiveState --value "$UNIT")
+    enabled=$(systemctl show --property=UnitFileState --value "$UNIT")
+    [[ "$active" == "$uninstall_active" && "$enabled" == "$uninstall_enabled" ]] || die "服务状态已变化，保留现状"
+    validate_managed_unit
+    validate_uninstall_unit_content "$UNIT_PATH"
+    validate_service_listener
+    changed=1
+    if [[ "$uninstall_active" == active ]]; then systemctl stop "$UNIT"; fi
+    systemctl --quiet disable "$UNIT"
+    local listeners
+    active=$(systemctl show --property=ActiveState --value "$UNIT")
+    enabled=$(systemctl show --property=UnitFileState --value "$UNIT")
+    [[ "$active" == inactive && "$enabled" == disabled ]] || die "服务未停止或未禁用"
+    listeners=$(ss -H -ltnp "sport = :$PORT") || die "端口查询失败"
+    [[ -z "$listeners" ]] || die "端口仍被占用，保留进程"
+    move_program "$INSTALL_ROOT" "$backup/program"
+    program_moved=1
+    backup_manifest create
+    write_uninstall_rollback
+    check_uninstall_backup
+    rm -- "$UNIT_PATH"
+    unit_removed=1
+    systemctl daemon-reload
+    verify_uninstalled || die "卸载状态核验失败"
+    completed=1
+    trap - EXIT
+    printf '已卸载；管理员、配置、证书和上传数据保留。\n备份：%s\n' "$backup"
+}
+
+select_action() {
+    local choice
+    printf '1 安装/更新\n2 卸载\n0 退出\n请选择：' >&2
+    read -r choice || die "未读取到选项"
+    case "$choice" in
+        1) install_bootstrap ;;
+        2) uninstall_bootstrap ;;
+        0) return 0 ;;
+        *) die "请选择 1、2 或 0" ;;
+    esac
+}
+
 main() {
-    install_bootstrap
+    [[ "$#" -le 1 ]] || die "用法：install.sh [--install|--uninstall]"
+    case "${1:-}" in
+        --install) install_bootstrap ;;
+        --uninstall) uninstall_bootstrap ;;
+        '') if [[ -t 0 ]]; then select_action; else install_bootstrap; fi ;;
+        *) die "用法：install.sh [--install|--uninstall]" ;;
+    esac
 }
 
 if [[ "${BOOTSTRAP_LIBRARY_ONLY:-0}" != 1 ]]; then
