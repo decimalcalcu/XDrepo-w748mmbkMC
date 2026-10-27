@@ -5,8 +5,8 @@ set -euo pipefail
 umask 077
 
 HOST="${PVE_HOST:-}"
-ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-native-v10.27.1/pve-maintenance-base-10.27.1.tar.gz'
-ARCHIVE_SHA256='bd38d5d11eee35777a5d23ef7092590c2b124979389a5ad6d0d56112a1af23f2'
+ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-native-v10.27.1/pve-maintenance-base-10.27.2.tar.gz'
+ARCHIVE_SHA256='85bd083216bea77ce60f9e9aacaf9799e65906ff8a11faea06fcb4bc91ac837e'
 
 [[ "$(id -u)" = 0 && "$(uname -s)" = Linux && "$(uname -m)" = x86_64 ]] || {
     echo '需要 Linux x86_64 root。' >&2; exit 2;
