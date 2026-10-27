@@ -5,8 +5,8 @@ set -euo pipefail
 umask 077
 
 HOST="${PVE_HOST:-}"
-ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-v10.27.1/pve-maintenance-base-10.27.1.tar.gz'
-ARCHIVE_SHA256='b3618499694e9bf86c32e64f753a1afe02687d1e2cf3c86960af73857e0331da'
+ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-native-v10.27.1/pve-maintenance-base-10.27.1.tar.gz'
+ARCHIVE_SHA256='bd38d5d11eee35777a5d23ef7092590c2b124979389a5ad6d0d56112a1af23f2'
 
 [[ "$(id -u)" = 0 && "$(uname -s)" = Linux && "$(uname -m)" = x86_64 ]] || {
     echo '需要 Linux x86_64 root。' >&2; exit 2;
@@ -44,9 +44,12 @@ printf '%s  %s\n' "$ARCHIVE_SHA256" "$work/base.tar.gz" | sha256sum --check --st
 # SHA 来自可信安装器，而不是下载归档内的声明；只有核对后才解包/执行。
 tar -xzf "$work/base.tar.gz" -C "$work/bundle" --no-same-owner --no-same-permissions
 chmod 0755 "$work/bundle/base/python/bin/python3.12"
+unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
-export PYTHONPATH="$work/bundle/site:$work/bundle/base/deps"
+export PVE_MAINTENANCE_PACKAGE_ROOT="$work/bundle/site/pve_maintenance"
+export PVE_MAINTENANCE_BASE="$work/bundle/base"
 export LD_LIBRARY_PATH="$work/bundle/base/python/lib:$work/bundle/base/native"
-"$work/bundle/base/python/bin/python3.12" -u -B -m pve_maintenance.first_install \
+chmod 0755 "$PVE_MAINTENANCE_PACKAGE_ROOT/pve-maintenance.bin"
+"$PVE_MAINTENANCE_PACKAGE_ROOT/pve-maintenance.bin" install \
     --bundle "$work/bundle" --trusted-key "$work/trusted-installer-key.pem" --host "$HOST"
 printf '初始化完成：https://%s:8887/；正式控制台安装后使用 8888。\n' "$HOST"
