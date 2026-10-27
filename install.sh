@@ -5,7 +5,7 @@ set -euo pipefail
 umask 077
 
 HOST="${PVE_HOST:-}"
-ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-native-v10.27.1/pve-maintenance-base-10.27.2.tar.gz'
+ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-native-v10.27.2/pve-maintenance-base-10.27.2.tar.gz'
 ARCHIVE_SHA256='85bd083216bea77ce60f9e9aacaf9799e65906ff8a11faea06fcb4bc91ac837e'
 
 [[ "$(id -u)" = 0 && "$(uname -s)" = Linux && "$(uname -m)" = x86_64 ]] || {
