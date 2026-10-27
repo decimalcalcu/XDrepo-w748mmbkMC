@@ -6,7 +6,7 @@ umask 077
 
 HOST="${PVE_HOST:-}"
 ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-native-v10.27.3/pve-maintenance-base-10.27.3.tar.gz'
-ARCHIVE_SHA256='f9e1d24dd4996df9537c1963dbb5e628bdb3c1ea98028b4c12a0cbf4239e5d5e'
+ARCHIVE_SHA256='f57beaabbbbbf0029d1bba4a3c3e70de04ee493c6880604ce54b41000accd613'
 
 [[ "$(id -u)" = 0 && "$(uname -s)" = Linux && "$(uname -m)" = x86_64 ]] || {
     echo '需要 Linux x86_64 root。' >&2; exit 2;
