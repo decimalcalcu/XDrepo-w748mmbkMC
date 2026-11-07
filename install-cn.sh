@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# 发布工具会填入固定 tag、归档 SHA256 和独立 Ed25519 公钥。
+# 初始信任来自用户事先核对的本脚本及其 SHA256；不建议 curl | bash。
+set -euo pipefail
+umask 077
+
+HOST="${PVE_HOST:-}"
+ARCHIVE_URL='https://github.com/decimalcalcu/XDrepo-w748mmbkMC/releases/download/maintenance-cn-v11.6.1/pve-cn-maintenance-base-11.6.1.tar.gz'
+ARCHIVE_SHA256='49b5e4fe4a158a9748939d6a626eb636c0ee93d5b2ebb135779cef206a5627ec'
+
+[[ "$(id -u)" = 0 && "$(uname -s)" = Linux && "$(uname -m)" = x86_64 ]] || {
+    echo '需要 Linux x86_64 root。' >&2; exit 2;
+}
+for command in curl sha256sum tar openssl mktemp chmod; do
+    command -v "$command" >/dev/null || { echo "缺少前置工具：$command" >&2; exit 2; }
+done
+[[ "$ARCHIVE_SHA256" =~ ^[a-f0-9]{64}$ ]] || { echo '请使用已填充固定版本的发布安装器。' >&2; exit 2; }
+
+# 只查询内核路由，不向目标地址发包；显式 PVE_HOST 仍可覆盖自动选择。
+if [[ -z "$HOST" ]]; then
+    for command in ip awk; do
+        command -v "$command" >/dev/null || { echo "自动识别 PVE 地址缺少工具：$command" >&2; exit 2; }
+    done
+    if ! route=$(ip -4 route get 1.1.1.1 2>/dev/null); then
+        echo '自动识别 PVE 地址失败：请检查 IPv4 默认路由。' >&2
+        exit 2
+    fi
+    HOST=$(printf '%s\n' "$route" | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')
+    [[ -n "$HOST" ]] || { echo '自动识别 PVE 地址失败：路由中没有 IPv4 源地址。' >&2; exit 2; }
+    printf '自动识别 PVE 地址：%s\n' "$HOST"
+fi
+
+work=$(mktemp -d /var/tmp/pve-cn-maintenance-install.XXXXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+mkdir "$work/bundle"
+cat > "$work/trusted-installer-key.pem" <<'PVE_TRUSTED_PUBLIC_KEY'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA8bbaK9vrHJRRFZFcLlzmkDFmfFY9QcpqISYORflanD8=
+-----END PUBLIC KEY-----
+PVE_TRUSTED_PUBLIC_KEY
+curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    "$ARCHIVE_URL" --output "$work/base.tar.gz"
+printf '%s  %s\n' "$ARCHIVE_SHA256" "$work/base.tar.gz" | sha256sum --check --status
+# SHA 来自可信安装器，而不是下载归档内的声明；只有核对后才解包/执行。
+tar -xzf "$work/base.tar.gz" -C "$work/bundle" --no-same-owner --no-same-permissions
+chmod 0755 "$work/bundle/base/python/bin/python3.12"
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1
+export PVE_MAINTENANCE_PACKAGE_ROOT="$work/bundle/site/pve_maintenance"
+export PVE_MAINTENANCE_BASE="$work/bundle/base"
+export LD_LIBRARY_PATH="$work/bundle/base/python/lib:$work/bundle/base/native"
+chmod 0755 "$PVE_MAINTENANCE_PACKAGE_ROOT/pve-maintenance.bin"
+"$PVE_MAINTENANCE_PACKAGE_ROOT/pve-maintenance.bin" install \
+    --bundle "$work/bundle" --trusted-key "$work/trusted-installer-key.pem" --host "$HOST"
+printf '初始化完成：https://%s:9887/；正式控制台安装后使用 9888。\n' "$HOST"
